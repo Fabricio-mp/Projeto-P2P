@@ -49,6 +49,12 @@ original_master_uuid          = None   # UUID do primeiro Master
 current_master_uuid           = None   # UUID do Master atualmente conectado
 last_registration_master_uuid = None   # UUID do Master da última apresentação
 
+# ── Sinalização de redirecionamento ─────────────────────────
+# Usado para acordar o loop de heartbeat imediatamente quando o Master
+# envia command_redirect, sem esperar o HEARTBEAT_INTERVAL terminar.
+_redirect_event = threading.Event()
+_redirect_target = {"host": None, "port": None}  # destino do redirect pendente
+
 
 # ════════════════════════════════════════════════════════════
 #  COMUNICAÇÃO
@@ -92,12 +98,17 @@ def receive_with_timeout(sock, timeout_seconds):
 #  CONEXÃO
 # ════════════════════════════════════════════════════════════
 
+def _ts():
+    """Retorna timestamp atual formatado para os logs."""
+    return time.strftime("%H:%M:%S")
+
+
 def connect(host, port):
     """Cria e retorna uma socket TCP conectada ao endereço informado."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(HEARTBEAT_TIMEOUT)
     sock.connect((host, port))
-    print(f"[WORKER] Conectado em {host}:{port}")
+    print(f"[{_ts()}] Conectado ao Master {host}:{port}")
     return sock
 
 
@@ -129,7 +140,7 @@ def set_master_target(host, port, reason=""):
         if original_master_target is None:
             original_master_target = (host, port)
     if reason:
-        print(f"[WORKER] Novo master alvo: {host}:{port} ({reason})")
+        print(f"[{_ts()}] ▶ Master alvo atualizado: {host}:{port} ({reason})")
 
 
 def get_master_target():
@@ -182,12 +193,11 @@ def register_with_master(sock):
         if original_master_uuid is None:
             original_master_uuid = response_server_uuid
 
-    print(f"[WORKER] Apresentacao enviada: {payload}")
+    print(f"[{_ts()}] Apresentado ao Master {current_master_uuid[:8] if current_master_uuid else '?'}.")
 
     if response.get("TASK") == "QUERY":
         process_task(sock, response)
-    elif response.get("TASK") == "NO_TASK":
-        print("[WORKER] Master informou que não havia tarefa na apresentação.")
+    # NO_TASK na apresentação é rotina — não loga
 
     last_registration_master_uuid = current_master_uuid
     return response
@@ -203,11 +213,12 @@ def process_task(sock, task_msg):
     user      = task_msg.get("USER", "desconhecido")
     force_nok = bool(task_msg.get("FORCE_NOK", False))
 
-    print(f"[WORKER] Processando tarefa {task_id} para {user}...")
+    status_label = "NOK" if force_nok else "OK"
+    print(f"[{_ts()}] ▶ Processando {task_id} (user={user}, forçar_nok={force_nok})")
     time.sleep(TASK_DURATION)
 
     send(sock, {
-        "STATUS": "NOK" if force_nok else "OK",
+        "STATUS": status_label,
         "TASK": "QUERY",
         "WORKER_UUID": WORKER_UUID,
         "TASK_ID": task_id,
@@ -215,21 +226,47 @@ def process_task(sock, task_msg):
 
     ack = receive(sock)
     if ack and ack.get("STATUS") == "ACK":
-        print(f"[WORKER] ACK recebido da tarefa {task_id}.")
+        print(f"[{_ts()}] ✔ {task_id} concluída → {status_label}")
     else:
-        print(f"[WORKER] Sem ACK explícito para a tarefa {task_id}.")
+        print(f"[{_ts()}] ✘ {task_id} concluída → {status_label} (sem ACK do Master)")
 
 
 def handle_master_message(sock, msg):
-    """Despacha mensagens recebidas do Master fora do fluxo de apresentação."""
+    """
+    Despacha mensagens recebidas do Master fora do fluxo de apresentação.
+    Retorna True se o loop deve continuar, False se deve reconectar
+    (ex: redirect recebido).
+    """
     if not isinstance(msg, dict):
-        return
-    if msg.get("TASK") == "QUERY":
+        return True
+
+    task = msg.get("TASK")
+
+    if task == "QUERY":
         process_task(sock, msg)
-    elif msg.get("TASK") == "NO_TASK":
-        print("[WORKER] Master informou que não há tarefa na fila.")
-    elif msg.get("TASK") == "HEARTBEAT" and msg.get("RESPONSE") == "ALIVE":
-        print("[WORKER] Heartbeat confirmado pelo Master.")
+
+    elif task == "NO_TASK":
+        pass  # rotina — sem tarefa na fila, silencioso
+
+    elif task == "HEARTBEAT" and msg.get("RESPONSE") == "ALIVE":
+        pass  # heartbeat confirmado — silencioso no fluxo normal
+
+    elif task == "command_redirect":
+        new_host = msg.get("NEW_MASTER_HOST")
+        new_port = int(msg.get("NEW_MASTER_PORT", MASTER_PORT))
+        if isinstance(new_host, str) and new_host:
+            print(f"[{_ts()}] ▶ Redirecionado para Master {new_host}:{new_port}")
+            set_master_target(new_host, new_port, "redirect do Master")
+            with master_target_lock:
+                _redirect_target["host"] = new_host
+                _redirect_target["port"] = new_port
+            _redirect_event.set()
+            return False
+
+    else:
+        print(f"[{_ts()}] Mensagem desconhecida do Master: task={task!r} — ignorada.")
+
+    return True
 
 
 # ════════════════════════════════════════════════════════════
@@ -248,9 +285,12 @@ def ensure_local_master_running():
     with master_process_lock:
         if master_process is not None and master_process.poll() is None:
             return
-        master_file   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "master.py")
-        master_process = subprocess.Popen([sys.executable, master_file], cwd=os.path.dirname(master_file))
-        print("[WORKER] Este no foi eleito master. Iniciando master.py local.")
+        master_file    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "master.py")
+        master_process = subprocess.Popen(
+            [sys.executable, master_file],
+            cwd=os.path.dirname(master_file),
+        )
+        print(f"[{_ts()}] ★ Eleito Master! Iniciando master.py local...")
 
 
 # ════════════════════════════════════════════════════════════
@@ -303,7 +343,7 @@ def election_server():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", ELECTION_PORT))
     server.listen(20)
-    print(f"[WORKER] Servidor de eleicao ativo em 0.0.0.0:{ELECTION_PORT}")
+    print(f"[{_ts()}] Servidor de eleição ativo na porta {ELECTION_PORT}")
 
     while True:
         conn, _ = server.accept()
@@ -368,13 +408,13 @@ def run_master_election():
 
     if not results:
         current_host, current_port = get_master_target()
-        print("[WORKER] Eleicao falhou: nenhum candidato respondeu.")
+        print(f"[{_ts()}] ✘ Eleição falhou: nenhum candidato respondeu.")
         return current_host, current_port
 
     winner      = max(results, key=lambda item: (item["free_bytes"], item["host"]))
     winner_host = winner["host"]
     winner_port = MASTER_PORT
-    print(f"[WORKER] Eleicao: novo master = {winner_host} (free={winner['free_bytes']} bytes)")
+    print(f"[{_ts()}] ★ Eleição: novo Master = {winner_host} ({winner['free_bytes'] // (1024**3)} GB livres)")
 
     ack_count = 0
     for host in candidates:
@@ -383,9 +423,9 @@ def run_master_election():
 
     required = (len(candidates) // 2) + 1
     if ack_count >= required:
-        print(f"[WORKER] Consenso atingido: {ack_count}/{len(candidates)} ACKs.")
+        print(f"[{_ts()}] ✔ Consenso atingido: {ack_count}/{len(candidates)} ACKs.")
     else:
-        print(f"[WORKER] Consenso parcial: {ack_count}/{len(candidates)} ACKs.")
+        print(f"[{_ts()}] ✘ Consenso parcial: {ack_count}/{len(candidates)} ACKs.")
 
     set_master_target(winner_host, winner_port, "eleicao")
     if is_local_host(winner_host):
@@ -397,34 +437,90 @@ def run_master_election():
 #  LOOP PRINCIPAL
 # ════════════════════════════════════════════════════════════
 
+def heartbeat_loop(sock):
+    """
+    Mantém a conexão ativa com o Master enviando heartbeats periódicos
+    e processando mensagens recebidas (tarefas, redirects) na mesma conexão.
+
+    MELHORIA: em vez de reconectar a cada ciclo, o Worker mantém a conexão
+    aberta e aguarda mensagens do Master com timeout de HEARTBEAT_INTERVAL.
+    Isso permite reagir a command_redirect imediatamente, sem depender
+    do próximo ciclo de reconexão.
+
+    Retorna:
+        "redirect"   → Master enviou command_redirect; reconectar no novo alvo.
+        "error"      → Conexão perdida; incrementar contador de erros.
+    """
+    while True:
+        send(sock, {"TASK": "HEARTBEAT", "SERVER_UUID": WORKER_UUID})
+        # heartbeat enviado — silencioso no fluxo normal
+
+        msg = receive_with_timeout(sock, HEARTBEAT_INTERVAL)
+
+        if msg is None:
+            print(f"[{_ts()}] ✘ Sem resposta do Master no heartbeat.")
+            return "error"
+
+        should_continue = handle_master_message(sock, msg)
+        if not should_continue:
+            # handle_master_message retorna False apenas em command_redirect
+            return "redirect"
+
+        # Se o Master mandou uma tarefa junto com o heartbeat, pode mandar
+        # mais mensagens em seguida (ex: NO_TASK logo após ACK). Drena sem bloquear.
+        extra = receive_with_timeout(sock, 0.5)
+        if extra is not None:
+            handle_master_message(sock, extra)
+
+
 def run(host, port):
-    """Loop principal: conecta ao Master, envia heartbeat e reconecta em falha."""
+    """Loop principal: conecta ao Master, mantém heartbeat e reconecta em falha."""
     global original_master_uuid, current_master_uuid, last_registration_master_uuid
 
     set_master_target(host, port, "inicial")
     threading.Thread(target=election_server, daemon=True).start()
 
-    sock              = None
+    sock               = None
     consecutive_errors = 0
 
     while True:
+        # Checa se houve redirect sinalizado por handle_master_message
+        if _redirect_event.is_set():
+            _redirect_event.clear()
+
         target_host, target_port = get_master_target()
         try:
             if sock is None:
                 sock = connect(target_host, target_port)
 
+            # Apresentação inicial na (re)conexão
             response = register_with_master(sock)
             if response is None:
-                raise TimeoutError("Resposta inválida ou ausente do Master na solicitacao")
+                raise TimeoutError("Resposta invalida ou ausente do Master na apresentacao")
 
             consecutive_errors = 0
-            time.sleep(HEARTBEAT_INTERVAL)
+
+            # Loop de heartbeat persistente na mesma conexão
+            result = heartbeat_loop(sock)
+
+            # Encerra socket independente do motivo
+            try:
+                sock.close()
+            except OSError:
+                pass
+            sock = None
+
+            if result == "redirect":
+                last_registration_master_uuid = None
+                print(f"[{_ts()}] Reconectando ao novo Master...")
+                continue
+
+            raise OSError("Heartbeat loop encerrado por erro de conexao")
 
         except (socket.timeout, TimeoutError, OSError):
             consecutive_errors += 1
             print(
-                f"[WORKER] Status: OFFLINE - Tentando Reconectar "
-                f"({consecutive_errors}/{CONNECTION_ERROR_THRESHOLD})"
+                f"[{_ts()}] ✘ OFFLINE — tentativa {consecutive_errors}/{CONNECTION_ERROR_THRESHOLD}"
             )
             try:
                 if sock is not None:
@@ -435,7 +531,7 @@ def run(host, port):
             last_registration_master_uuid = None
 
             if consecutive_errors >= CONNECTION_ERROR_THRESHOLD:
-                print("[WORKER] Downtime detectado. Iniciando eleicao de master.")
+                print(f"[{_ts()}] Master inativo. Iniciando eleição...")
                 run_master_election()
                 consecutive_errors = 0
 
@@ -455,5 +551,6 @@ if __name__ == "__main__":
     host = sys.argv[1]
     port = int(sys.argv[2])
 
-    print(f"[WORKER] UUID: {WORKER_UUID}")
+    print(f"[{_ts()}] Worker iniciado | UUID: {WORKER_UUID[:8]}")
+    print(f"[{_ts()}] Conectando a {host}:{port}...")
     run(host, port)

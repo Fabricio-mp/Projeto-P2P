@@ -17,18 +17,22 @@ from config import (
     MASTER_HOST,
     MASTER_PORT,
     LOAD_THRESHOLD,
-    TASK_DURATION,
     REQUEST_INTERVAL,
     NEIGHBOR_MASTERS,
     SPRINT1_HEARTBEAT_ONLY,
 )
 
 # ── Estado global ────────────────────────────────────────────
-workers        = {}               # { worker_uuid: socket }
-pending        = 0                # tarefas ainda não concluídas
-pending_lock   = threading.Lock()
-task_queue     = []               # fila de tarefas aguardando worker disponível
+workers         = {}               # { worker_uuid: socket }
+pending         = 0                # tarefas ainda não concluídas
+pending_lock    = threading.Lock()
+task_queue      = []               # fila de tarefas aguardando worker disponível
 task_queue_lock = threading.Lock()
+
+# ── Guard de pedido de ajuda ─────────────────────────────────
+# Garante que apenas UMA thread ask_for_help rode por vez,
+# evitando flood de requisições ao vizinho quando saturado.
+_help_in_progress = threading.Event()
 
 
 # ════════════════════════════════════════════════════════════
@@ -170,7 +174,7 @@ def handle_worker(worker_uuid, conn, first_msg=None):
         # ── Heartbeat ou apresentação ────────────────────────
         if msg.get("TASK") == "HEARTBEAT" or msg.get("WORKER") == "ALIVE":
             if not valid_heartbeat(msg):
-                print("[MASTER] HEARTBEAT/APRESENTAÇÃO inválido: campos obrigatórios ausentes.")
+                print("[MASTER] HEARTBEAT/APRESENTACAO invalido: campos obrigatorios ausentes.")
                 workers.pop(worker_uuid, None)
                 conn.close()
                 return
@@ -186,7 +190,7 @@ def handle_worker(worker_uuid, conn, first_msg=None):
         # ── Relatório de conclusão de tarefa ─────────────────
         elif "STATUS" in msg or msg.get("TASK") == "QUERY":
             if not valid_status_report(msg):
-                print(f"[MASTER] Status inválido de {worker_uuid[:8]}. Encerrando conexão.")
+                print(f"[MASTER] Status invalido de {worker_uuid[:8]}. Encerrando conexao.")
                 workers.pop(worker_uuid, None)
                 conn.close()
                 return
@@ -194,7 +198,7 @@ def handle_worker(worker_uuid, conn, first_msg=None):
             status  = msg.get("STATUS")
             with pending_lock:
                 pending = max(0, pending - 1)
-            print(f"[MASTER] Tarefa {task_id} concluída por {worker_uuid[:8]} com status {status}. Pendentes: {pending}")
+            print(f"[MASTER] Tarefa {task_id} concluida por {worker_uuid[:8]} com status {status}. Pendentes: {pending}")
             send(conn, {"STATUS": "ACK", "WORKER_UUID": worker_uuid, "TASK_ID": task_id})
 
         # ── Formato legado de conclusão ───────────────────────
@@ -202,14 +206,22 @@ def handle_worker(worker_uuid, conn, first_msg=None):
             task_id = msg.get("TASK_ID")
             with pending_lock:
                 pending = max(0, pending - 1)
-            print(f"[MASTER] Tarefa {task_id} concluída por {worker_uuid[:8]}. Pendentes: {pending}")
+            print(f"[MASTER] Tarefa {task_id} concluida por {worker_uuid[:8]}. Pendentes: {pending}")
 
         # ── Registro de Worker (próprio ou temporário) ────────
         elif msg.get("TASK") in ("register_worker", "register_temporary_worker"):
-            wid = msg.get("WORKER_UUID", worker_uuid)
+            wid  = msg.get("WORKER_UUID", worker_uuid)
             workers[wid] = conn
-            kind = "temporário " if "temporary" in msg.get("TASK", "") else ""
+            kind = "temporario " if "temporary" in msg.get("TASK", "") else ""
             print(f"[MASTER] Worker {kind}{wid[:8]} registrado.")
+
+        # ── Redirecionamento recebido (Worker emprestado voltando) ──
+        elif msg.get("TASK") == "command_redirect":
+            # Master recebendo redirect é incomum; apenas loga e ignora.
+            print(f"[MASTER] command_redirect recebido de {worker_uuid[:8]} — ignorado pelo Master.")
+
+        else:
+            print(f"[MASTER] Mensagem desconhecida de {worker_uuid[:8]}: {msg.get('TASK', '?')} — ignorada.")
 
         msg = None
 
@@ -239,11 +251,11 @@ def accept_loop():
         # ── Heartbeat ou apresentação de Worker ──────────────
         if task == "HEARTBEAT" or msg.get("WORKER") == "ALIVE":
             if not valid_heartbeat(msg):
-                print(f"[MASTER] HEARTBEAT/APRESENTAÇÃO inválido de {addr}. Conexão encerrada.")
+                print(f"[MASTER] HEARTBEAT/APRESENTACAO invalido de {addr}. Conexao encerrada.")
                 conn.close()
                 continue
             if msg.get("WORKER") == "ALIVE":
-                origem = "emprestado" if borrowed_worker(msg) else "próprio"
+                origem = "emprestado" if borrowed_worker(msg) else "proprio"
                 print(f"[MASTER] Worker {origem} {worker_uuid[:8]} apresentou-se de {addr}.")
             else:
                 print(f"[MASTER] Heartbeat recebido de {worker_uuid[:8]}.")
@@ -252,7 +264,7 @@ def accept_loop():
         # ── Registro direto de Worker ────────────────────────
         elif "register" in task:
             workers[worker_uuid] = conn
-            kind = "temporário" if "temporary" in task else "próprio"
+            kind = "temporario" if "temporary" in task else "proprio"
             print(f"[MASTER] Worker {kind} {worker_uuid[:8]} conectado de {addr}.")
             threading.Thread(target=handle_worker, args=(worker_uuid, conn, msg), daemon=True).start()
 
@@ -273,6 +285,10 @@ def accept_loop():
             print("[MASTER] Vizinho liberou os workers. Redirecionando de volta.")
             conn.close()
 
+        else:
+            print(f"[MASTER] Mensagem desconhecida de {addr}: task={task!r} — conexao encerrada.")
+            conn.close()
+
 
 # ════════════════════════════════════════════════════════════
 #  GERAÇÃO DE CARGA
@@ -283,8 +299,20 @@ def load_generator():
     global pending
     users = ["User1", "User2", "User3", "User4"]
     count = 0
+    # Teto da fila: evita crescimento infinito quando workers nao conseguem
+    # consumir na mesma velocidade que o gerador produz.
+    QUEUE_CAP = LOAD_THRESHOLD * 4
+
     while True:
         time.sleep(REQUEST_INTERVAL)
+
+        with task_queue_lock:
+            queue_size = len(task_queue)
+
+        if queue_size >= QUEUE_CAP:
+            # Fila cheia: pausa a geracao e aguarda os workers drenarem.
+            print(f"[MASTER] Fila cheia ({queue_size}/{QUEUE_CAP}) — aguardando workers...")
+            continue
 
         task_id   = f"TASK-{count:04d}"
         user      = users[count % len(users)]
@@ -297,10 +325,10 @@ def load_generator():
             pending += 1
             current_pending = pending
 
-        print(f"[MASTER] Tarefa {task_id} enfileirada para {user}. Pendentes: {current_pending}")
+        print(f"[MASTER] {task_id} enfileirada | fila={queue_size+1} pendentes={current_pending}")
 
-        if current_pending > LOAD_THRESHOLD:
-            print(f"[MASTER] SATURADO! ({current_pending} pendentes). Pedindo ajuda...")
+        if current_pending > LOAD_THRESHOLD and not _help_in_progress.is_set():
+            print(f"[MASTER] Saturado ({current_pending} pendentes) — pedindo ajuda ao vizinho...")
             threading.Thread(target=ask_for_help, daemon=True).start()
 
 
@@ -309,39 +337,61 @@ def load_generator():
 # ════════════════════════════════════════════════════════════
 
 def ask_for_help():
-    """Contata Masters vizinhos solicitando empréstimo de Workers."""
-    for (host, port) in NEIGHBOR_MASTERS:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((host, port))
-            send(sock, {"SERVER_UUID": SERVER_UUID, "TASK": "request_help", "MASTER_PORT": MASTER_PORT})
-            resp = receive(sock)
-            if resp and resp.get("TASK") == "response_accepted":
-                print(f"[MASTER] Vizinho {host}:{port} aceitou ajudar!")
+    """
+    Contata Masters vizinhos solicitando empréstimo de Workers.
+    O guard _help_in_progress permanece ativo enquanto o sistema estiver
+    saturado — só é liberado quando pending cair abaixo de LOAD_THRESHOLD,
+    evitando flood de requisições repetidas ao vizinho.
+    """
+    if _help_in_progress.is_set():
+        return
+    _help_in_progress.set()
+
+    try:
+        # Tenta cada vizinho uma vez
+        accepted = False
+        for (host, port) in NEIGHBOR_MASTERS:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect((host, port))
+                send(sock, {"SERVER_UUID": SERVER_UUID, "TASK": "request_help", "MASTER_PORT": MASTER_PORT})
+                resp = receive(sock)
                 sock.close()
-                return
-            else:
-                print(f"[MASTER] Vizinho {host}:{port} rejeitou.")
-                sock.close()
-        except OSError as e:
-            print(f"[MASTER] Não conectou ao vizinho {host}:{port} — {e}")
+                if resp and resp.get("TASK") == "response_accepted":
+                    print(f"[MASTER] Vizinho {host}:{port} aceitou — worker a caminho.")
+                    accepted = True
+                    break
+            except OSError:
+                pass  # vizinho inacessível — tenta o próximo
+
+        if not accepted:
+            # Nenhum vizinho pôde ajudar agora. Aguarda até a saturação baixar
+            # antes de liberar o guard, evitando disparar pedidos repetidos.
+            while True:
+                time.sleep(2)
+                with pending_lock:
+                    still_saturated = pending > LOAD_THRESHOLD
+                if not still_saturated:
+                    break
+    finally:
+        _help_in_progress.clear()
 
 
 def handle_help_request(conn, msg):
     """Responde a um pedido de ajuda: empresta 1 Worker ou rejeita se não houver."""
     if len(workers) > 1:
-        w_uuid         = list(workers.keys())[0]
-        w_sock         = workers[w_uuid]
+        w_uuid            = list(workers.keys())[0]
+        w_sock            = workers[w_uuid]
         requester_host, _ = conn.getpeername()
-        requester_port = msg.get("MASTER_PORT", MASTER_PORT)
+        requester_port    = msg.get("MASTER_PORT", MASTER_PORT)
 
         print(f"[MASTER] Aceitei ajudar. Redirecionando Worker {w_uuid[:8]}.")
         send(conn, {"SERVER_UUID": SERVER_UUID, "TASK": "response_accepted", "WORKERS_TO_SEND": 1})
         send(w_sock, {"TASK": "command_redirect", "NEW_MASTER_HOST": requester_host, "NEW_MASTER_PORT": requester_port})
         workers.pop(w_uuid, None)
     else:
-        print("[MASTER] Sem workers para emprestar. Rejeitando.")
+        # Rejeição silenciosa — é o comportamento esperado com poucos workers
         send(conn, {"SERVER_UUID": SERVER_UUID, "TASK": "response_rejected"})
     conn.close()
 
