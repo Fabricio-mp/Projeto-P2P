@@ -8,6 +8,7 @@ import time
 import uuid
 import json
 import sys
+from logger_config import worker_logger
 import os
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ from config import (
     HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, MASTER_PORT,
     TASK_DURATION, CONNECTION_ERROR_THRESHOLD,
     ELECTION_PORT, ELECTION_RETRY_INTERVAL, ELECTION_CANDIDATES,
+    WORKER_HOST, WORKER_PORT,
 )
 
 WORKER_UUID = str(uuid.uuid4())
@@ -36,7 +38,25 @@ _redirect_event  = threading.Event()
 _redirect_target = {"host": None, "port": None}
 
 
-# ── Comunicação ──────────────────────────────────────────────
+# ── Comunicação P2P ──────────────────────────────────────────
+
+def wrap_p2p_message(msg_type, payload):
+    return {
+        "type": msg_type,
+        "request_id": str(uuid.uuid4()),
+        "payload": payload
+    }
+
+def parse_p2p_message(msg):
+    if not isinstance(msg, dict):
+        return None
+    if "type" in msg:
+        if "request_id" not in msg or "payload" not in msg:
+            worker_logger.info("Falha no parser P2P: campos obrigatorios ausentes.")
+            return None
+        return msg
+    return msg
+
 
 def send(sock, payload):
     try:
@@ -45,15 +65,19 @@ def send(sock, payload):
         pass
 
 
+_socket_buffers = {}
+
 def receive(sock):
     try:
-        data = b""
+        data = _socket_buffers.get(sock, b"")
         while b"\n" not in data:
             chunk = sock.recv(4096)
             if not chunk:
                 return None
             data += chunk
-        return json.loads(data.split(b"\n")[0])
+        parts = data.split(b"\n", 1)
+        _socket_buffers[sock] = parts[1] if len(parts) > 1 else b""
+        return json.loads(parts[0])
     except Exception:
         return None
 
@@ -79,7 +103,7 @@ def connect(host, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(HEARTBEAT_TIMEOUT)
     sock.connect((host, port))
-    print(f"[{_ts()}] Conectado ao Master {host}:{port}")
+    worker_logger.info(f"Conectado ao Master {host}:{port}")
     return sock
 
 
@@ -106,7 +130,7 @@ def set_master_target(host, port, reason=""):
         if original_master_target is None:
             original_master_target = (host, port)
     if reason:
-        print(f"[{_ts()}] ▶ Master alvo atualizado: {host}:{port} ({reason})")
+        worker_logger.info(f"▶ Master alvo atualizado: {host}:{port} ({reason})")
 
 
 def get_master_target():
@@ -118,14 +142,18 @@ def get_master_target():
 
 def build_presentation_payload():
     current_host, current_port = get_master_target()
-    payload = {"WORKER": "ALIVE", "WORKER_UUID": WORKER_UUID}
+    
     if (
         original_master_target is not None
         and original_master_uuid is not None
         and (current_host, current_port) != original_master_target
     ):
-        payload["SERVER_UUID"] = original_master_uuid
-    return payload
+        return wrap_p2p_message("register_temporary_worker", {
+            "worker_id": WORKER_UUID,
+            "original_master_address": {"host": original_master_target[0], "port": original_master_target[1]}
+        })
+
+    return {"WORKER": "ALIVE", "WORKER_UUID": WORKER_UUID}
 
 
 def register_with_master(sock):
@@ -136,16 +164,17 @@ def register_with_master(sock):
     if not response:
         return None
 
-    srv_uuid = response.get("SERVER_UUID")
+    srv_uuid = response.get("SERVER_UUID") or response.get("payload", {}).get("SERVER_UUID")
     if isinstance(srv_uuid, str) and srv_uuid.strip():
         current_master_uuid = srv_uuid
         if original_master_uuid is None:
             original_master_uuid = srv_uuid
 
-    print(f"[{_ts()}] Apresentado ao Master {current_master_uuid[:8] if current_master_uuid else '?'}.")
+    worker_logger.info(f"Apresentado ao Master {current_master_uuid[:8] if current_master_uuid else '?'}.")
 
-    if response.get("TASK") == "QUERY":
-        process_task(sock, response)
+    task = response.get("TASK") or response.get("type")
+    if task == "QUERY":
+        process_task(sock, response.get("payload", response))
 
     last_registration_master_uuid = current_master_uuid
     return response
@@ -159,43 +188,73 @@ def process_task(sock, task_msg):
     force_nok = bool(task_msg.get("FORCE_NOK", False))
     status    = "NOK" if force_nok else "OK"
 
-    print(f"[{_ts()}] ▶ Processando {task_id} (user={user}, forçar_nok={force_nok})")
+    worker_logger.info(f"▶ Processando {task_id} (user={user}, forçar_nok={force_nok})")
     time.sleep(TASK_DURATION)
 
     send(sock, {"STATUS": status, "TASK": "QUERY", "WORKER_UUID": WORKER_UUID, "TASK_ID": task_id})
 
-    ack = receive(sock)
-    symbol = "✔" if ack and ack.get("STATUS") == "ACK" else "✘"
-    suffix = "" if ack and ack.get("STATUS") == "ACK" else " (sem ACK do Master)"
-    print(f"[{_ts()}] {symbol} {task_id} concluída → {status}{suffix}")
+    # O Master pode enviar command_redirect ou command_release concorrentemente.
+    # Precisamos processar até achar o ACK ou timeout.
+    got_ack = False
+    for _ in range(5):
+        ack = receive_with_timeout(sock, 2.0)
+        if not ack:
+            break
+        if ack.get("STATUS") == "ACK":
+            got_ack = True
+            break
+        else:
+            handle_master_message(sock, ack)
+            if _redirect_event.is_set():
+                break
+
+    symbol = "✔" if got_ack else "✘"
+    suffix = "" if got_ack else " (sem ACK do Master)"
+    worker_logger.info(f"{symbol} {task_id} concluída → {status}{suffix}")
 
 
-def handle_master_message(sock, msg):
+def handle_master_message(sock, raw_msg):
     """Retorna True para continuar o loop, False para reconectar (redirect)."""
-    if not isinstance(msg, dict):
+    msg = parse_p2p_message(raw_msg)
+    if msg is None:
         return True
 
-    task = msg.get("TASK")
+    msg_type = msg.get("type") or msg.get("TASK")
+    payload = msg.get("payload", msg)
 
-    if task == "QUERY":
-        process_task(sock, msg)
-    elif task in ("NO_TASK", None):
+    if msg_type == "QUERY":
+        process_task(sock, payload)
+    elif msg_type in ("NO_TASK", None):
         pass
-    elif task == "HEARTBEAT" and msg.get("RESPONSE") == "ALIVE":
+    elif msg_type == "HEARTBEAT" and payload.get("RESPONSE") == "ALIVE":
         pass
-    elif task == "command_redirect":
-        new_host = msg.get("NEW_MASTER_HOST")
-        new_port = int(msg.get("NEW_MASTER_PORT", MASTER_PORT))
+    elif msg_type == "command_redirect":
+        new_addr = payload.get("new_master_address", {})
+        new_host = new_addr.get("host") if "host" in new_addr else payload.get("NEW_MASTER_HOST")
+        new_port = int(new_addr.get("port") if "port" in new_addr else payload.get("NEW_MASTER_PORT", MASTER_PORT))
+        
         if isinstance(new_host, str) and new_host:
-            print(f"[{_ts()}] ▶ Redirecionado para Master {new_host}:{new_port}")
+            worker_logger.info(f"▶ Redirecionado para Master {new_host}:{new_port}")
             set_master_target(new_host, new_port, "redirect do Master")
             with master_target_lock:
                 _redirect_target["host"] = new_host
                 _redirect_target["port"] = new_port
             _redirect_event.set()
             return False
+            
+    elif msg_type == "command_release":
+        orig_addr = payload.get("original_master_address", {})
+        if orig_addr and "host" in orig_addr:
+            worker_logger.info(f"▶ Liberado pelo Master. Voltando para original {orig_addr['host']}:{orig_addr['port']}")
+            set_master_target(orig_addr["host"], orig_addr["port"], "liberado do Master temporario")
+            with master_target_lock:
+                _redirect_target["host"] = orig_addr["host"]
+                _redirect_target["port"] = orig_addr["port"]
+            _redirect_event.set()
+            return False
+            
     else:
-        print(f"[{_ts()}] Mensagem desconhecida do Master: task={task!r} — ignorada.")
+        worker_logger.info(f"Mensagem desconhecida do Master: task={msg_type!r} — ignorada.")
 
     return True
 
@@ -216,7 +275,7 @@ def ensure_local_master_running():
             [sys.executable, master_file],
             cwd=os.path.dirname(master_file),
         )
-        print(f"[{_ts()}] ★ Eleito Master! Iniciando master.py local...")
+        worker_logger.info(f"★ Eleito Master! Iniciando master.py local...")
 
 
 # ── Eleição de Master ────────────────────────────────────────
@@ -259,7 +318,7 @@ def election_server():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", ELECTION_PORT))
     server.listen(20)
-    print(f"[{_ts()}] Servidor de eleição ativo na porta {ELECTION_PORT}")
+    worker_logger.info(f"Servidor de eleição ativo na porta {ELECTION_PORT}")
     while True:
         conn, _ = server.accept()
         threading.Thread(target=handle_election_message, args=(conn,), daemon=True).start()
@@ -312,19 +371,19 @@ def run_master_election():
     results    = [d for host in candidates if (d := query_candidate_disk(host)) is not None]
 
     if not results:
-        print(f"[{_ts()}] ✘ Eleição falhou: nenhum candidato respondeu.")
+        worker_logger.info(f"✘ Eleição falhou: nenhum candidato respondeu.")
         return get_master_target()
 
     winner      = max(results, key=lambda x: (x["free_bytes"], x["host"]))
     winner_host = winner["host"]
     winner_port = MASTER_PORT
-    print(f"[{_ts()}] ★ Eleição: novo Master = {winner_host} ({winner['free_bytes'] // (1024**3)} GB livres)")
+    worker_logger.info(f"★ Eleição: novo Master = {winner_host} ({winner['free_bytes'] // (1024**3)} GB livres)")
 
     ack_count = sum(1 for host in candidates if announce_winner(host, winner_host, winner_port))
     required  = (len(candidates) // 2) + 1
     symbol    = "✔" if ack_count >= required else "✘"
     label     = "Consenso atingido" if ack_count >= required else "Consenso parcial"
-    print(f"[{_ts()}] {symbol} {label}: {ack_count}/{len(candidates)} ACKs.")
+    worker_logger.info(f"{symbol} {label}: {ack_count}/{len(candidates)} ACKs.")
 
     set_master_target(winner_host, winner_port, "eleicao")
     if is_local_host(winner_host):
@@ -340,19 +399,29 @@ def heartbeat_loop(sock):
     Mantém conexão aberta para reagir imediatamente a redirects.
     """
     while True:
+        if _redirect_event.is_set():
+            return "redirect"
+
         send(sock, {"TASK": "HEARTBEAT", "SERVER_UUID": WORKER_UUID})
 
         msg = receive_with_timeout(sock, HEARTBEAT_INTERVAL)
         if msg is None:
-            print(f"[{_ts()}] ✘ Sem resposta do Master no heartbeat.")
+            worker_logger.info(f"✘ Sem resposta do Master no heartbeat.")
             return "error"
 
         if not handle_master_message(sock, msg):
             return "redirect"
+            
+        if _redirect_event.is_set():
+            return "redirect"
 
         extra = receive_with_timeout(sock, 0.5)
         if extra is not None:
-            handle_master_message(sock, extra)
+            if not handle_master_message(sock, extra):
+                return "redirect"
+                
+        if _redirect_event.is_set():
+            return "redirect"
 
 
 def run(host, port):
@@ -388,14 +457,14 @@ def run(host, port):
 
             if result == "redirect":
                 last_registration_master_uuid = None
-                print(f"[{_ts()}] Reconectando ao novo Master...")
+                worker_logger.info(f"Reconectando ao novo Master...")
                 continue
 
             raise OSError("Heartbeat loop encerrado por erro de conexao")
 
         except (socket.timeout, TimeoutError, OSError):
             consecutive_errors += 1
-            print(f"[{_ts()}] ✘ OFFLINE — tentativa {consecutive_errors}/{CONNECTION_ERROR_THRESHOLD}")
+            worker_logger.info(f"✘ OFFLINE — tentativa {consecutive_errors}/{CONNECTION_ERROR_THRESHOLD}")
             try:
                 if sock is not None:
                     sock.close()
@@ -404,8 +473,15 @@ def run(host, port):
             sock                          = None
             last_registration_master_uuid = None
 
+            curr_host, curr_port = get_master_target()
+            if original_master_target and (curr_host, curr_port) != original_master_target:
+                worker_logger.info(f"Falha no Master temporario. Voltando para Master original.")
+                set_master_target(original_master_target[0], original_master_target[1], "falha no temporario")
+                consecutive_errors = 0
+                continue
+
             if consecutive_errors >= CONNECTION_ERROR_THRESHOLD:
-                print(f"[{_ts()}] Master inativo. Iniciando eleição...")
+                worker_logger.info(f"Master inativo. Iniciando eleição...")
                 run_master_election()
                 consecutive_errors = 0
 
@@ -415,13 +491,17 @@ def run(host, port):
 # ── Entry point ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Uso: python worker.py <host> <porta>")
-        print("Exemplo: python worker.py 127.0.0.1 5000")
-        sys.exit(1)
+    try:
+        if len(sys.argv) >= 3:
+            host = sys.argv[1]
+            port = int(sys.argv[2])
+        else:
+            host = WORKER_HOST
+            port = WORKER_PORT
 
-    host = sys.argv[1]
-    port = int(sys.argv[2])
-    print(f"[{_ts()}] Worker iniciado | UUID: {WORKER_UUID[:8]}")
-    print(f"[{_ts()}] Conectando a {host}:{port}...")
-    run(host, port)
+        worker_logger.info(f"Worker iniciado | UUID: {WORKER_UUID[:8]}")
+        worker_logger.info(f"Conectando a {host}:{port}...")
+        run(host, port)
+    except KeyboardInterrupt:
+        worker_logger.info(f"\nEncerrado pelo worker.")
+        sys.exit(0)

@@ -3,21 +3,27 @@
 
 import uuid
 import socket
+from logger_config import setup_logger
 
+config_logger = setup_logger("CONFIG")
 SERVER_UUID = str(uuid.uuid4())
 
 # Rede do Master
-MASTER_HOST = "0.0.0.0"
+MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 5000
+
+# Rede do Worker (alvo inicial para conexao ao Master)
+WORKER_HOST = "127.0.0.1"
+WORKER_PORT = 5000
 
 # Comportamento de tarefas
 LOAD_THRESHOLD   = 5    # tarefas pendentes antes de pedir ajuda ao vizinho
-TASK_DURATION    = 3    # segundos simulados por tarefa no Worker
+TASK_DURATION    = 0.5  # segundos simulados por tarefa no Worker
 REQUEST_INTERVAL = 1.0  # segundos entre geração de tarefas
 
 # Heartbeat
-HEARTBEAT_INTERVAL = 30.0  # intervalo entre heartbeats
-HEARTBEAT_TIMEOUT  = 5.0   # timeout de resposta
+HEARTBEAT_INTERVAL = 2.0  # intervalo entre heartbeats
+HEARTBEAT_TIMEOUT  = 5.0  # timeout de resposta
 
 # Sprint 1: True → só HEARTBEAT; False → fluxo completo
 SPRINT1_HEARTBEAT_ONLY = False
@@ -41,7 +47,7 @@ def _self_neighbor_warning():
         local = {"127.0.0.1", "localhost"}
     for host, port in NEIGHBOR_MASTERS:
         if host in local and port == MASTER_PORT:
-            print(
+            config_logger.warning(
                 f"[CONFIG] AVISO: NEIGHBOR_MASTERS aponta para este próprio processo "
                 f"({host}:{port}). Pedidos de ajuda vão falhar ou ser auto-enviados. "
                 "Configure o IP real do vizinho para uso em producao."
