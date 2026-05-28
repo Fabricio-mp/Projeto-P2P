@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# master.py — Aceita Workers, distribui tarefas e negocia ajuda com vizinhos.
-
 import socket
 import threading
 import time
@@ -15,19 +12,23 @@ from config import (
     NEIGHBOR_MASTERS, SPRINT1_HEARTBEAT_ONLY,
 )
 
-# Estado global
-workers          = {}
-borrowed_workers = {}
-pending          = 0
-pending_lock     = threading.Lock()
-task_queue       = []
-task_queue_lock  = threading.Lock()
 
-# Impede flood de requisições ao vizinho quando saturado
+workers          = {} 
+borrowed_workers = {}  
+pending          = 0
+
+
+pending_lock     = threading.Lock()
+task_queue_lock  = threading.Lock()
+workers_lock     = threading.Lock()
+
+task_queue       = []
+
+
 _help_in_progress = threading.Event()
 
 
-# ── Comunicação P2P ──────────────────────────────────────────
+
 
 def wrap_p2p_message(msg_type, payload):
     return {
@@ -71,7 +72,6 @@ def receive(sock):
         return None
 
 
-# ── Validação ────────────────────────────────────────────────
 
 def _valid_uuid_field(msg, key):
     v = msg.get(key)
@@ -83,7 +83,7 @@ def valid_heartbeat(msg):
         return False
     if msg.get("TASK") == "HEARTBEAT":
         return _valid_uuid_field(msg, "SERVER_UUID")
-    if msg.get("WORKER") == "ALIVE":
+    if str(msg.get("WORKER")).lower() == "alive":
         return _valid_uuid_field(msg, "WORKER_UUID")
     return False
 
@@ -93,12 +93,12 @@ def valid_status_report(msg):
         return False
     if not all(k in msg for k in ("STATUS", "TASK", "WORKER_UUID")):
         return False
-    if msg.get("STATUS") not in {"OK", "NOK"} or msg.get("TASK") != "QUERY":
+    if msg.get("STATUS") not in {"OK", "NOK"} or str(msg.get("TASK")).lower() != "query":
         return False
     return _valid_uuid_field(msg, "WORKER_UUID")
 
 
-# ── Utilitários ──────────────────────────────────────────────
+
 
 def build_alive_response():
     return {"SERVER_UUID": SERVER_UUID, "TASK": "HEARTBEAT", "RESPONSE": "ALIVE"}
@@ -109,7 +109,7 @@ def borrowed_worker(msg):
     return isinstance(srv, str) and srv.strip() and srv != SERVER_UUID
 
 
-# ── Fila de tarefas ──────────────────────────────────────────
+
 
 def enqueue_task(task_id, user, force_nok=False):
     with task_queue_lock:
@@ -137,7 +137,7 @@ def dispatch_next_task(conn, worker_uuid):
     master_logger.info(f"[MASTER] Enviando {task['TASK_ID']} para Worker {worker_uuid[:8]} | USER={task['USER']}")
 
 
-# ── Atendimento de Workers ───────────────────────────────────
+
 
 def handle_worker(worker_uuid, conn, first_msg=None):
     global pending
@@ -148,8 +148,9 @@ def handle_worker(worker_uuid, conn, first_msg=None):
 
         if raw_msg is None:
             master_logger.info(f"[MASTER] Worker {worker_uuid[:8]} desconectou.")
-            workers.pop(worker_uuid, None)
-            borrowed_workers.pop(worker_uuid, None)
+            with workers_lock:
+                workers.pop(worker_uuid, None)
+                borrowed_workers.pop(worker_uuid, None)
             conn.close()
             return
 
@@ -158,36 +159,40 @@ def handle_worker(worker_uuid, conn, first_msg=None):
             raw_msg = None
             continue
             
-        msg_type = p2p_msg.get("type") or p2p_msg.get("TASK", "")
+        msg_type = str(p2p_msg.get("type", p2p_msg.get("TASK", ""))).lower()
         payload = p2p_msg.get("payload", p2p_msg)
 
-        if msg_type == "HEARTBEAT" or p2p_msg.get("WORKER") == "ALIVE":
+        if msg_type == "heartbeat" or str(p2p_msg.get("WORKER")).lower() == "alive":
             if not valid_heartbeat(p2p_msg):
-                master_logger.info("[MASTER] HEARTBEAT/APRESENTACAO invalido: campos obrigatorios ausentes.")
-                workers.pop(worker_uuid, None)
-                borrowed_workers.pop(worker_uuid, None)
+                master_logger.info(f"[MASTER] Heartbeat invalido de {worker_uuid[:8]}. Encerrando conexao.")
+                with workers_lock:
+                    workers.pop(worker_uuid, None)
+                    borrowed_workers.pop(worker_uuid, None)
                 conn.close()
                 return
-            if p2p_msg.get("WORKER") == "ALIVE":
-                origem = "emprestado" if borrowed_worker(p2p_msg) else "local"
-                workers[worker_uuid] = conn
-                master_logger.info(f"[MASTER] Worker {origem} {worker_uuid[:8]} apresentado.")
+            if str(p2p_msg.get("WORKER")).lower() == "alive":
+                with workers_lock:
+                    workers[worker_uuid] = conn
+                pass
             else:
                 send(conn, build_alive_response())
+            
             dispatch_next_task(conn, worker_uuid)
 
-        elif "STATUS" in p2p_msg or msg_type == "QUERY":
+        elif "STATUS" in p2p_msg or msg_type == "query":
             if not valid_status_report(p2p_msg):
                 master_logger.info(f"[MASTER] Status invalido de {worker_uuid[:8]}. Encerrando conexao.")
-                workers.pop(worker_uuid, None)
-                borrowed_workers.pop(worker_uuid, None)
+                with workers_lock:
+                    workers.pop(worker_uuid, None)
+                    borrowed_workers.pop(worker_uuid, None)
                 conn.close()
                 return
             task_id = p2p_msg.get("TASK_ID", "SEM_ID")
             status  = p2p_msg.get("STATUS")
             with pending_lock:
                 pending = max(0, pending - 1)
-            master_logger.info(f"[MASTER] Tarefa {task_id} concluida por {worker_uuid[:8]} com status {status}. Pendentes: {pending}")
+            origem = "(Worker Emprestado) " if worker_uuid in borrowed_workers else ""
+            master_logger.info(f"[MASTER] Tarefa {task_id} concluida por {origem}{worker_uuid[:8]} com status {status}. Pendentes: {pending}")
             send(conn, {"STATUS": "ACK", "WORKER_UUID": worker_uuid, "TASK_ID": task_id})
 
         elif msg_type == "task_done":
@@ -198,16 +203,17 @@ def handle_worker(worker_uuid, conn, first_msg=None):
 
         elif msg_type in ("register_worker", "register_temporary_worker"):
             wid  = payload.get("worker_id", worker_uuid)
-            workers[wid] = conn
-            if msg_type == "register_temporary_worker":
-                orig_addr = payload.get("original_master_address")
-                if orig_addr:
-                    borrowed_workers[wid] = orig_addr
-                master_logger.info(f"[MASTER] Worker temporario {wid[:8]} registrado.")
-            else:
-                master_logger.info(f"[MASTER] Worker {wid[:8]} registrado.")
+            with workers_lock:
+                workers[wid] = conn
+                if msg_type == "register_temporary_worker":
+                    orig_addr = payload.get("original_master_address")
+                    if orig_addr:
+                        borrowed_workers[wid] = orig_addr
+                    master_logger.info(f"[MASTER] Worker temporario {wid[:8]} registrado.")
+                else:
+                    master_logger.info(f"[MASTER] Worker {wid[:8]} registrado.")
             
-            # Enviar a primeira tarefa (ou NO_TASK) para finalizar o handshake de apresentação
+          
             dispatch_next_task(conn, wid)
 
         elif msg_type == "command_redirect":
@@ -219,7 +225,7 @@ def handle_worker(worker_uuid, conn, first_msg=None):
         raw_msg = None
 
 
-# ── Loop de aceitação ────────────────────────────────────────
+
 
 def accept_loop():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -240,16 +246,27 @@ def accept_loop():
             conn.close()
             continue
 
-        msg_type = p2p_msg.get("type") or p2p_msg.get("TASK", "")
+        msg_type_raw = p2p_msg.get("type") or p2p_msg.get("TASK") or p2p_msg.get("WORKER")
+        if not msg_type_raw:
+            conn.close()
+            continue
+        msg_type = str(msg_type_raw).lower()
         payload = p2p_msg.get("payload", p2p_msg)
         worker_uuid = payload.get("worker_id") or p2p_msg.get("WORKER_UUID") or p2p_msg.get("SERVER_UUID") or str(uuid.uuid4())
 
-        if msg_type == "HEARTBEAT" or p2p_msg.get("WORKER") == "ALIVE":
+        sprint03_types = {"request_help", "response_accepted", "response_rejected", "command_redirect", "register_temporary_worker", "command_release", "notify_worker_returned"}
+        if msg_type in sprint03_types:
+            if "request_id" not in p2p_msg or "payload" not in p2p_msg:
+                master_logger.error(f"[MASTER] Erro de strict parsing: Mensagem '{msg_type}' incompleta (sem request_id ou payload).")
+                conn.close()
+                continue
+
+        if msg_type == "heartbeat" or str(p2p_msg.get("WORKER")).lower() == "alive":
             if not valid_heartbeat(p2p_msg):
                 master_logger.info(f"[MASTER] HEARTBEAT/APRESENTACAO invalido de {addr}. Conexao encerrada.")
                 conn.close()
                 continue
-            if p2p_msg.get("WORKER") == "ALIVE":
+            if str(p2p_msg.get("WORKER")).lower() == "alive":
                 origem = "emprestado" if borrowed_worker(p2p_msg) else "proprio"
                 master_logger.info(f"[MASTER] Worker {origem} {worker_uuid[:8]} apresentou-se de {addr}.")
             else:
@@ -257,14 +274,15 @@ def accept_loop():
             threading.Thread(target=handle_worker, args=(worker_uuid, conn, raw_msg), daemon=True).start()
 
         elif "register" in msg_type:
-            workers[worker_uuid] = conn
-            if msg_type == "register_temporary_worker":
-                orig_addr = payload.get("original_master_address")
-                if orig_addr:
-                    borrowed_workers[worker_uuid] = orig_addr
-                master_logger.info(f"[MASTER] Worker temporario {worker_uuid[:8]} conectado de {addr}.")
-            else:
-                master_logger.info(f"[MASTER] Worker proprio {worker_uuid[:8]} conectado de {addr}.")
+            with workers_lock:
+                workers[worker_uuid] = conn
+                if msg_type == "register_temporary_worker":
+                    orig_addr = payload.get("original_master_address")
+                    if orig_addr:
+                        borrowed_workers[worker_uuid] = orig_addr
+                    master_logger.info(f"[MASTER] Worker temporario {worker_uuid[:8]} conectado de {addr}.")
+                else:
+                    master_logger.info(f"[MASTER] Worker proprio {worker_uuid[:8]} conectado de {addr}.")
             threading.Thread(target=handle_worker, args=(worker_uuid, conn, raw_msg), daemon=True).start()
 
         elif msg_type == "request_help":
@@ -292,26 +310,36 @@ def accept_loop():
             conn.close()
 
 
-# ── Geração de carga e Devolução ──────────────────────────────
+
 
 def release_worker(wid, orig_addr):
-    conn = workers.get(wid)
+    with workers_lock:
+        conn = workers.get(wid)
     if conn:
         cmd = wrap_p2p_message("command_release", {"original_master_address": orig_addr})
         send(conn, cmd)
-        workers.pop(wid, None)
-    borrowed_workers.pop(wid, None)
+        with workers_lock:
+            workers.pop(wid, None)
+    with workers_lock:
+        borrowed_workers.pop(wid, None)
     
     try:
+        orig_host, orig_port = orig_addr.split(":")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
-        sock.connect((orig_addr["host"], orig_addr["port"]))
+        sock.connect((orig_host, int(orig_port)))
         msg = wrap_p2p_message("notify_worker_returned", {"worker_id": wid})
         send(sock, msg)
         sock.close()
     except OSError:
         pass
-    master_logger.info(f"[MASTER] Worker temporario {wid[:8]} liberado e devolvido para {orig_addr['host']}:{orig_addr['port']}.")
+    master_logger.info(f"[MASTER] Worker temporario {wid[:8]} liberado e devolvido para {orig_addr}.")
+
+def release_borrowed_workers():
+    with workers_lock:
+        if borrowed_workers:
+            for wid, orig_addr in list(borrowed_workers.items()):
+                release_worker(wid, orig_addr)
 
 
 def load_generator():
@@ -348,12 +376,9 @@ def load_generator():
             threading.Thread(target=ask_for_help, daemon=True).start()
             
         elif current_pending < (LOAD_THRESHOLD * 0.5):
-            if borrowed_workers:
-                for wid, orig_addr in list(borrowed_workers.items()):
-                    release_worker(wid, orig_addr)
+            release_borrowed_workers()
 
 
-# ── Negociação entre Masters ─────────────────────────────────
 
 def ask_for_help():
     if _help_in_progress.is_set():
@@ -370,69 +395,98 @@ def ask_for_help():
                     "master_id": SERVER_UUID,
                     "current_load": pending,
                     "capacity": LOAD_THRESHOLD,
-                    "workers_needed": 1,
+                    "workers_needed": 2,
                     "master_port": MASTER_PORT
                 })
                 send(sock, req)
                 resp = receive(sock)
                 sock.close()
                 p2p_resp = parse_p2p_message(resp)
-                if p2p_resp and p2p_resp.get("type") == "response_accepted":
+                
+                resp_type_raw = p2p_resp.get("type") if p2p_resp else None
+                if not resp_type_raw:
+                    continue
+                resp_type = str(resp_type_raw).lower()
+                
+                if "request_id" not in p2p_resp or "payload" not in p2p_resp:
+                    master_logger.error(f"[MASTER] Erro de strict parsing: Resposta '{resp_type}' sem request_id ou payload. Descartando.")
+                    continue
+
+                if resp_type == "response_accepted":
                     master_logger.info(f"[MASTER] Vizinho {host}:{port} aceitou — worker a caminho.")
                     accepted = True
                     break
+                elif resp_type == "response_rejected":
+                    reason = p2p_resp.get("payload", {}).get("reason", "desconhecido")
+                    master_logger.info(f"[MASTER] Vizinho {host}:{port} recusou ajuda (motivo: {reason}).")
+            except socket.timeout:
+                master_logger.warning(f"[MASTER] Timeout ao aguardar resposta do vizinho {host}:{port}. Descartando request.")
             except OSError:
                 pass
 
         if accepted:
-            # Espera a fila baixar (o worker emprestado deve ajudar a drenar)
+            
             while True:
                 time.sleep(2)
                 with pending_lock:
                     if pending <= LOAD_THRESHOLD:
                         break
         else:
-            # Se rejeitado, aguarda 5 segundos antes de tentar pedir novamente
+            
             time.sleep(5)
     finally:
         _help_in_progress.clear()
 
 
 def handle_help_request(conn, payload, req_id):
-    if len(workers) > 1:
-        w_uuid            = list(workers.keys())[0]
-        w_sock            = workers[w_uuid]
-        requester_host, _ = conn.getpeername()
-        requester_port    = payload.get("master_port", MASTER_PORT)
-        master_logger.info(f"[MASTER] Aceitei ajudar. Redirecionando Worker {w_uuid[:8]}.")
+    needed = payload.get("workers_needed", 1)
+    
+    with workers_lock:
         
-        resp = {
-            "type": "response_accepted",
-            "request_id": req_id,
-            "payload": {
-                "workers_offered": 1,
-                "worker_details": {"id": w_uuid, "address": "?"}
+        available_to_lend = max(0, len(workers) - 1)
+        to_lend = min(needed, available_to_lend)
+        
+        if to_lend > 0:
+            requester_host, _ = conn.getpeername()
+            requester_port    = payload.get("master_port", MASTER_PORT)
+            
+            offered_workers = []
+            workers_keys = list(workers.keys())[:to_lend]
+            
+            for w_uuid in workers_keys:
+                offered_workers.append({"id": w_uuid, "address": "?"})
+                
+            master_logger.info(f"[MASTER] Aceitei ajudar. Redirecionando {to_lend} Worker(s).")
+            
+            resp = {
+                "type": "response_accepted",
+                "request_id": req_id,
+                "payload": {
+                    "workers_offered": to_lend,
+                    "worker_details": offered_workers
+                }
             }
-        }
-        send(conn, resp)
-        
-        redirect_cmd = wrap_p2p_message("command_redirect", {
-            "new_master_address": {"host": requester_host, "port": requester_port}
-        })
-        send(w_sock, redirect_cmd)
-        workers.pop(w_uuid, None)
-        borrowed_workers.pop(w_uuid, None)
-    else:
-        resp = {
-            "type": "response_rejected",
-            "request_id": req_id,
-            "payload": {"reason": "high_load"}
-        }
-        send(conn, resp)
+            send(conn, resp)
+            
+            for w_uuid in workers_keys:
+                w_sock = workers[w_uuid]
+                redirect_cmd = wrap_p2p_message("command_redirect", {
+                    "new_master_address": f"{requester_host}:{requester_port}"
+                })
+                send(w_sock, redirect_cmd)
+                workers.pop(w_uuid, None)
+                borrowed_workers.pop(w_uuid, None)
+        else:
+            resp = {
+                "type": "response_rejected",
+                "request_id": req_id,
+                "payload": {"reason": "high_load"}
+            }
+            send(conn, resp)
     conn.close()
 
 
-# ── Entry point ──────────────────────────────────────────────
+
 
 if __name__ == "__main__":
     try:
@@ -440,6 +494,20 @@ if __name__ == "__main__":
             MASTER_PORT = int(sys.argv[1])
         if len(sys.argv) >= 3:
             NEIGHBOR_MASTERS = [("127.0.0.1", int(sys.argv[2]))]
+            
+        
+        if len(sys.argv) == 1:
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                test_sock.bind((MASTER_HOST, 5000))
+                test_sock.close()
+                MASTER_PORT = 5000
+                NEIGHBOR_MASTERS = [("127.0.0.1", 5001)]
+            except OSError:
+                
+                test_sock.close()
+                MASTER_PORT = 5001
+                NEIGHBOR_MASTERS = [("127.0.0.1", 5000)]
 
         master_logger.info(f"[MASTER] Iniciando | UUID: {SERVER_UUID}")
         master_logger.info(f"[MASTER] Porta local: {MASTER_PORT} | Vizinho: {NEIGHBOR_MASTERS[0][1]}")

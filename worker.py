@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-# worker.py — Conecta ao Master, processa tarefas, detecta falha e inicia eleição.
-# Uso: python3 worker.py <host> <porta>
-#Exemplo: python worker.py 127.0.0.1 5000
-
 import socket
 import time
 import uuid
@@ -37,8 +32,10 @@ last_registration_master_uuid = None
 _redirect_event  = threading.Event()
 _redirect_target = {"host": None, "port": None}
 
+_processed_task_recently = False
 
-# ── Comunicação P2P ──────────────────────────────────────────
+
+
 
 def wrap_p2p_message(msg_type, payload):
     return {
@@ -93,7 +90,7 @@ def receive_with_timeout(sock, timeout_seconds):
         sock.settimeout(original)
 
 
-# ── Conexão ──────────────────────────────────────────────────
+
 
 def _ts():
     return time.strftime("%H:%M:%S")
@@ -120,7 +117,7 @@ def is_local_host(host):
     return host in local_addresses()
 
 
-# ── Master alvo ──────────────────────────────────────────────
+
 
 def set_master_target(host, port, reason=""):
     global original_master_target
@@ -138,7 +135,7 @@ def get_master_target():
         return master_target["host"], master_target["port"]
 
 
-# ── Apresentação ─────────────────────────────────────────────
+
 
 def build_presentation_payload():
     current_host, current_port = get_master_target()
@@ -150,7 +147,8 @@ def build_presentation_payload():
     ):
         return wrap_p2p_message("register_temporary_worker", {
             "worker_id": WORKER_UUID,
-            "original_master_address": {"host": original_master_target[0], "port": original_master_target[1]}
+            "original_master_address": f"{original_master_target[0]}:{original_master_target[1]}",
+            "SERVER_UUID": original_master_uuid
         })
 
     return {"WORKER": "ALIVE", "WORKER_UUID": WORKER_UUID}
@@ -180,9 +178,12 @@ def register_with_master(sock):
     return response
 
 
-# ── Processamento de tarefas ─────────────────────────────────
+
 
 def process_task(sock, task_msg):
+    global _processed_task_recently
+    _processed_task_recently = True
+    
     task_id   = task_msg.get("TASK_ID", "SEM_ID")
     user      = task_msg.get("USER", "desconhecido")
     force_nok = bool(task_msg.get("FORCE_NOK", False))
@@ -193,8 +194,7 @@ def process_task(sock, task_msg):
 
     send(sock, {"STATUS": status, "TASK": "QUERY", "WORKER_UUID": WORKER_UUID, "TASK_ID": task_id})
 
-    # O Master pode enviar command_redirect ou command_release concorrentemente.
-    # Precisamos processar até achar o ACK ou timeout.
+  
     got_ack = False
     for _ in range(5):
         ack = receive_with_timeout(sock, 2.0)
@@ -229,9 +229,13 @@ def handle_master_message(sock, raw_msg):
     elif msg_type == "HEARTBEAT" and payload.get("RESPONSE") == "ALIVE":
         pass
     elif msg_type == "command_redirect":
-        new_addr = payload.get("new_master_address", {})
-        new_host = new_addr.get("host") if "host" in new_addr else payload.get("NEW_MASTER_HOST")
-        new_port = int(new_addr.get("port") if "port" in new_addr else payload.get("NEW_MASTER_PORT", MASTER_PORT))
+        new_addr = payload.get("new_master_address", "")
+        if isinstance(new_addr, str) and ":" in new_addr:
+            new_host, new_port_str = new_addr.split(":", 1)
+            new_port = int(new_port_str)
+        else:
+            new_host = payload.get("NEW_MASTER_HOST")
+            new_port = int(payload.get("NEW_MASTER_PORT", MASTER_PORT))
         
         if isinstance(new_host, str) and new_host:
             worker_logger.info(f"▶ Redirecionado para Master {new_host}:{new_port}")
@@ -243,13 +247,15 @@ def handle_master_message(sock, raw_msg):
             return False
             
     elif msg_type == "command_release":
-        orig_addr = payload.get("original_master_address", {})
-        if orig_addr and "host" in orig_addr:
-            worker_logger.info(f"▶ Liberado pelo Master. Voltando para original {orig_addr['host']}:{orig_addr['port']}")
-            set_master_target(orig_addr["host"], orig_addr["port"], "liberado do Master temporario")
+        orig_addr = payload.get("original_master_address", "")
+        if isinstance(orig_addr, str) and ":" in orig_addr:
+            orig_host, orig_port_str = orig_addr.split(":", 1)
+            orig_port = int(orig_port_str)
+            worker_logger.info(f"▶ Liberado pelo Master. Voltando para original {orig_host}:{orig_port}")
+            set_master_target(orig_host, orig_port, "liberado do Master temporario")
             with master_target_lock:
-                _redirect_target["host"] = orig_addr["host"]
-                _redirect_target["port"] = orig_addr["port"]
+                _redirect_target["host"] = orig_host
+                _redirect_target["port"] = orig_port
             _redirect_event.set()
             return False
             
@@ -259,7 +265,7 @@ def handle_master_message(sock, raw_msg):
     return True
 
 
-# ── Processo master local ─────────────────────────────────────
+
 
 def get_free_disk_bytes():
     return shutil.disk_usage(os.path.dirname(os.path.abspath(__file__))).free
@@ -278,7 +284,6 @@ def ensure_local_master_running():
         worker_logger.info(f"★ Eleito Master! Iniciando master.py local...")
 
 
-# ── Eleição de Master ────────────────────────────────────────
 
 def unique_candidates():
     seen = dict.fromkeys(h for h in ELECTION_CANDIDATES if h)
@@ -391,18 +396,20 @@ def run_master_election():
     return winner_host, winner_port
 
 
-# ── Loop principal ───────────────────────────────────────────
 
 def heartbeat_loop(sock):
     """
     Retorna "redirect" se Master enviou command_redirect, "error" em falha.
     Mantém conexão aberta para reagir imediatamente a redirects.
     """
+    global _processed_task_recently
     while True:
+        _processed_task_recently = False
         if _redirect_event.is_set():
             return "redirect"
 
-        send(sock, {"TASK": "HEARTBEAT", "SERVER_UUID": WORKER_UUID})
+        server_uuid_to_send = original_master_uuid if (original_master_target is not None and current_master_uuid != original_master_uuid) else WORKER_UUID
+        send(sock, {"TASK": "HEARTBEAT", "SERVER_UUID": server_uuid_to_send})
 
         msg = receive_with_timeout(sock, HEARTBEAT_INTERVAL)
         if msg is None:
@@ -422,6 +429,9 @@ def heartbeat_loop(sock):
                 
         if _redirect_event.is_set():
             return "redirect"
+
+        if not _processed_task_recently:
+            time.sleep(HEARTBEAT_INTERVAL)
 
 
 def run(host, port):
@@ -488,7 +498,7 @@ def run(host, port):
             time.sleep(ELECTION_RETRY_INTERVAL)
 
 
-# ── Entry point ──────────────────────────────────────────────
+
 
 if __name__ == "__main__":
     try:

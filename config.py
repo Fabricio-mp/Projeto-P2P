@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# config.py — Parâmetros centrais do sistema Master/Worker.
-
 import uuid
 import socket
 from logger_config import setup_logger
@@ -8,34 +5,33 @@ from logger_config import setup_logger
 config_logger = setup_logger("CONFIG")
 SERVER_UUID = str(uuid.uuid4())
 
-# Rede do Master
+
 MASTER_HOST = "127.0.0.1"
 MASTER_PORT = 5000
 
-# Rede do Worker (alvo inicial para conexao ao Master)
+
 WORKER_HOST = "127.0.0.1"
 WORKER_PORT = 5000
 
-# Comportamento de tarefas
-LOAD_THRESHOLD   = 5    # tarefas pendentes antes de pedir ajuda ao vizinho
-TASK_DURATION    = 0.5  # segundos simulados por tarefa no Worker
-REQUEST_INTERVAL = 1.0  # segundos entre geração de tarefas
 
-# Heartbeat
-HEARTBEAT_INTERVAL = 2.0  # intervalo entre heartbeats
-HEARTBEAT_TIMEOUT  = 5.0  # timeout de resposta
+LOAD_THRESHOLD   = 5    
+TASK_DURATION    = 0.5  
+REQUEST_INTERVAL = 1.0  
 
-# Sprint 1: True → só HEARTBEAT; False → fluxo completo
+
+HEARTBEAT_INTERVAL = 2.0  
+HEARTBEAT_TIMEOUT  = 5.0  
+
+
 SPRINT1_HEARTBEAT_ONLY = False
 
-# Reconexão e eleição
-CONNECTION_ERROR_THRESHOLD = 4        # falhas antes de iniciar eleição
-ELECTION_PORT              = 5100     # porta de comunicação de eleição
-ELECTION_RETRY_INTERVAL    = 2.0     # intervalo entre tentativas
+
+CONNECTION_ERROR_THRESHOLD = 4        
+ELECTION_PORT              = 5100     
+ELECTION_RETRY_INTERVAL    = 2.0     
 ELECTION_CANDIDATES        = ["127.0.0.1"]
 
-# Masters vizinhos para pedido de ajuda em caso de saturação.
-# Em produção: configure com o IP real do vizinho.
+
 NEIGHBOR_MASTERS = [("127.0.0.1", 5000)]
 
 
